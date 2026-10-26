@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>Camera Lab — WP30 Pro</title>
+<style>
+  body{margin:0;background:#000;color:#eee;font-family:system-ui;overflow:hidden}
+  #wrap{position:relative;width:100vw;height:100dvh}
+  video,canvas{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover}
+  #ui{position:absolute;bottom:0;left:0;right:0;padding:16px;
+      background:linear-gradient(transparent,rgba(0,0,0,.85));
+      display:flex;flex-direction:column;gap:10px}
+  select,button{padding:12px;border-radius:12px;border:1px solid #444;
+      background:#1a1a1a;color:#eee;font-size:1rem;font-family:inherit}
+  button:active{background:#333}
+  .row{display:flex;gap:8px}
+  .row>*{flex:1}
+  #status{font-size:.8rem;color:#888;text-align:center}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="glcanvas"></canvas>
+  <div id="ui">
+    <select id="cameraSelect"></select>
+    <div class="row">
+      <select id="filterSelect">
+        <option value="none">Без фильтра</option>
+        <option value="pixelate">Пикселизация</option>
+        <option value="edge">Контуры (Sobel)</option>
+        <option value="thermal">Тепловизор</option>
+        <option value="night">Ночное видение (усиление)</option>
+      </select>
+      <button id="snap">📸 Снимок</button>
+    </div>
+    <div id="status">Инициализация…</div>
+  </div>
+</div>
+
+<script>
+(async function(){
+  const video = document.getElementById('video');
+  const canvas = document.getElementById('glcanvas');
+  const gl = canvas.getContext('webgl');
+  if (!gl) { document.getElementById('status').textContent = 'WebGL не поддерживается'; return; }
+
+  // --- Шейдеры ---
+  const vs = `attribute vec2 a; varying vec2 uv; void main(){ uv=a*0.5+0.5; gl_Position=vec4(a,0.,1.); }`;
+  const fsSource = `
+    precision mediump float;
+    varying vec2 uv;
+    uniform sampler2D tex;
+    uniform int mode;
+    uniform vec2 resolution;
+    void main(){
+      vec4 c = texture2D(tex, uv);
+      if(mode==1){ // пикселизация
+        float px = 8.0; // размер блока
+        vec2 grid = floor(uv * resolution / px) * px / resolution;
+        c = texture2D(tex, grid);
+      } else if(mode==2){ // Sobel (контуры)
+        vec2 t = 1.0 / resolution;
+        vec4 gx = texture2D(tex, uv+vec2(-t.x,-t.y)) + 2.0*texture2D(tex, uv+vec2(-t.x,0.)) + texture2D(tex, uv+vec2(-t.x,t.y))
+                - texture2D(tex, uv+vec2(t.x,-t.y)) - 2.0*texture2D(tex, uv+vec2(t.x,0.)) - texture2D(tex, uv+vec2(t.x,t.y));
+        vec4 gy = texture2D(tex, uv+vec2(-t.x,-t.y)) + 2.0*texture2D(tex, uv+vec2(0.,-t.y)) + texture2D(tex, uv+vec2(t.x,-t.y))
+                - texture2D(tex, uv+vec2(-t.x,t.y)) - 2.0*texture2D(tex, uv+vec2(0.,t.y)) - texture2D(tex, uv+vec2(t.x,t.y));
+        float g = length(gx.rgb) + length(gy.rgb);
+        c = vec4(vec3(g), 1.0);
+      } else if(mode==3){ // псевдо-тепловизор
+        float lum = dot(c.rgb, vec3(0.299,0.587,0.114));
+        vec3 col = mix(vec3(0.,0.,1.), vec3(1.,0.,0.), lum);
+        c = vec4(col, 1.0);
+      } else if(mode==4){ // ночное видение (усиление + зелёный)
+        float lum = dot(c.rgb, vec3(0.299,0.587,0.114));
+        lum = pow(lum, 0.45); // гамма-усиление
+        c = vec4(0.1*lum, lum, 0.1*lum, 1.0);
+      }
+      gl_FragColor = c;
+    }`;
+
+  function compile(shader, src, type){
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl, vs, gl.VERTEX_SHADER));
+  gl.attachShader(prog, compile(gl, fsSource, gl.FRAGMENT_SHADER));
+  gl.linkProgram(prog);
+  gl.useProgram(prog);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+  const aLoc = gl.getAttribLocation(prog, 'a');
+  gl.enableVertexAttribArray(aLoc);
+  gl.vertexAttribPointer(aLoc, 2, gl.FLOAT, false, 0, 0);
+
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+
+  const uMode = gl.getUniformLocation(prog, 'mode');
+  const uRes = gl.getUniformLocation(prog, 'resolution');
+
+  let currentStream = null;
+
+  async function listCameras(){
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cams = devices.filter(d => d.kind === 'videoinput');
+    const sel = document.getElementById('cameraSelect');
+    sel.innerHTML = '';
+    cams.forEach((cam, i) => {
+      const opt = document.createElement('option');
+      opt.value = cam.deviceId;
+      opt.textContent = cam.label || `Камера ${i+1}`;
+      sel.appendChild(opt);
+    });
+    document.getElementById('status').textContent = `Найдено камер: ${cams.length}`;
+    return cams;
+  }
+
+  async function startCamera(deviceId){
+    if(currentStream) currentStream.getTracks().forEach(t => t.stop());
+    try {
+      const constraints = {
+        video: {
+          deviceId: deviceId ? { exact: deviceId } : undefined,
+          facingMode: deviceId ? undefined : 'environment',
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
+        }
+      };
+      currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = currentStream;
+      await video.play();
+      document.getElementById('status').textContent = 'Камера активна';
+    } catch(e) {
+      document.getElementById('status').textContent = 'Ошибка: ' + e.message;
+    }
+  }
+
+  // Инициализация
+  await listCameras();
+  const firstCam = document.getElementById('cameraSelect').value;
+  if(firstCam) await startCamera(firstCam);
+
+  document.getElementById('cameraSelect').addEventListener('change', e => startCamera(e.target.value));
+
+  // Рендер-цикл
+  function render(){
+    if(video.readyState >= 2){
+      if(canvas.width !== video.videoWidth){
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        gl.viewport(0, 0, canvas.width, canvas.height);
+      }
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+      const mode = parseInt(document.getElementById('filterSelect').value === 'none' ? 0 :
+        document.getElementById('filterSelect').value === 'pixelate' ? 1 :
+        document.getElementById('filterSelect').value === 'edge' ? 2 :
+        document.getElementById('filterSelect').value === 'thermal' ? 3 : 4);
+      gl.uniform1i(uMode, mode);
+      gl.uniform2f(uRes, canvas.width, canvas.height);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+    requestAnimationFrame(render);
+  }
+  render();
+
+  // Снимок
+  document.getElementById('snap').addEventListener('click', () => {
+    const link = document.createElement('a');
+    link.download = 'camera-lab-' + Date.now() + '.png';
+    link.href = canvas.toDataURL('image/png');
+    link.click();
+  });
+})();
+</script>
+</body>
+</html>
