@@ -2,41 +2,62 @@
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
 <meta name="theme-color" content="#000000">
-<title>Camera Lab — WP30 Pro</title>
+<title>AEGIS Scanner</title>
 <style>
-  body{margin:0;background:#000;color:#eee;font-family:system-ui;overflow:hidden}
-  #wrap{position:relative;width:100vw;height:100dvh}
-  video,canvas{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover}
-  #ui{position:absolute;bottom:0;left:0;right:0;padding:16px;
-      background:linear-gradient(transparent,rgba(0,0,0,.85));
-      display:flex;flex-direction:column;gap:10px}
-  select,button{padding:12px;border-radius:12px;border:1px solid #444;
-      background:#1a1a1a;color:#eee;font-size:1rem;font-family:inherit}
-  button:active{background:#333}
-  .row{display:flex;gap:8px}
+  body{margin:0;background:#000;color:#0f0;font-family:monospace;overflow:hidden}
+  #wrap{position:relative;width:100vw;height:100dvh;background:#000}
+  video{display:none}
+  canvas{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover}
+  #hud{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;
+       box-shadow:inset 0 0 100px rgba(0,255,0,0.2);border:2px solid rgba(0,255,0,0.3);box-sizing:border-box}
+  /* Прицел по центру */
+  #hud::before{content:'';position:absolute;top:50%;left:50%;width:40px;height:40px;
+       transform:translate(-50%,-50%);border:1px solid rgba(0,255,0,0.5);border-radius:50%}
+  #hud::after{content:'+';position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+       color:rgba(0,255,0,0.8);font-size:20px;line-height:1}
+  
+  #ui{position:absolute;bottom:0;left:0;right:0;padding:20px;
+      background:linear-gradient(transparent,rgba(0,0,0,0.9));
+      display:flex;flex-direction:column;gap:12px}
+  
+  .row{display:flex;gap:10px}
+  select,button{padding:14px;border-radius:8px;border:1px solid #0f0;
+      background:rgba(0,20,0,0.8);color:#0f0;font-size:14px;font-family:monospace;
+      text-transform:uppercase;font-weight:bold;letter-spacing:1px}
+  button:active{background:#0f0;color:#000}
   .row>*{flex:1}
-  #status{font-size:.8rem;color:#888;text-align:center}
+  
+  .active{background:#0f0 !important;color:#000 !important}
+  #status{position:absolute;top:10px;left:10px;font-size:12px;color:#0f0;
+      background:rgba(0,0,0,0.5);padding:5px 10px;border-left:2px solid #0f0}
+  #target-box{position:absolute;border:2px solid #f00;display:none;pointer-events:none;
+      box-shadow:0 0 10px #f00}
+  /* Текст target */
+  #target-box::after{content:'TARGET';position:absolute;top:-20px;left:-2px;
+      color:#f00;font-size:12px;font-weight:bold}
 </style>
 </head>
 <body>
 <div id="wrap">
   <video id="video" autoplay playsinline muted></video>
+  <!-- Слой WebGL (видео со стекингом) -->
   <canvas id="glcanvas"></canvas>
+  <!-- Слой 2D (детектор движения) -->
+  <canvas id="motioncanvas" style="pointer-events:none"></canvas>
+  <div id="hud"></div>
+  <div id="target-box"></div>
+  
+  <div id="status">SYS.INIT...</div>
+
   <div id="ui">
     <select id="cameraSelect"></select>
     <div class="row">
-      <select id="filterSelect">
-        <option value="none">Без фильтра</option>
-        <option value="pixelate">Пикселизация</option>
-        <option value="edge">Контуры (Sobel)</option>
-        <option value="thermal">Тепловизор</option>
-        <option value="night">Ночное видение (усиление)</option>
-      </select>
-      <button id="snap">📸 Снимок</button>
+      <button id="btn-stack" class="active">📷 Стекинг: ВКЛ</button>
+      <button id="btn-motion" class="active">🎯 Детектор: ВКЛ</button>
     </div>
-    <div id="status">Инициализация…</div>
+    <button id="btn-snap">📸 ЗАХВАТ</button>
   </div>
 </div>
 
@@ -44,55 +65,47 @@
 (async function(){
   const video = document.getElementById('video');
   const canvas = document.getElementById('glcanvas');
-  const gl = canvas.getContext('webgl');
-  if (!gl) { document.getElementById('status').textContent = 'WebGL не поддерживается'; return; }
+  const mCanvas = document.getElementById('motioncanvas');
+  const mCtx = mCanvas.getContext('2d', { willReadFrequently: true });
+  const statusEl = document.getElementById('status');
+  const targetBox = document.getElementById('target-box');
 
-  // --- Шейдеры ---
+  const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true });
+  if (!gl) { statusEl.textContent = 'WEBGL ERROR'; return; }
+
+  // --- WebGL Шейдеры для накопления (стекинга) ---
   const vs = `attribute vec2 a; varying vec2 uv; void main(){ uv=a*0.5+0.5; gl_Position=vec4(a,0.,1.); }`;
-  const fsSource = `
+  const fs = `
     precision mediump float;
     varying vec2 uv;
-    uniform sampler2D tex;
-    uniform int mode;
-    uniform vec2 resolution;
+    uniform sampler2D currentTex;
+    uniform sampler2D prevTex;
+    uniform float blend;
     void main(){
-      vec4 c = texture2D(tex, uv);
-      if(mode==1){ // пикселизация
-        float px = 8.0; // размер блока
-        vec2 grid = floor(uv * resolution / px) * px / resolution;
-        c = texture2D(tex, grid);
-      } else if(mode==2){ // Sobel (контуры)
-        vec2 t = 1.0 / resolution;
-        vec4 gx = texture2D(tex, uv+vec2(-t.x,-t.y)) + 2.0*texture2D(tex, uv+vec2(-t.x,0.)) + texture2D(tex, uv+vec2(-t.x,t.y))
-                - texture2D(tex, uv+vec2(t.x,-t.y)) - 2.0*texture2D(tex, uv+vec2(t.x,0.)) - texture2D(tex, uv+vec2(t.x,t.y));
-        vec4 gy = texture2D(tex, uv+vec2(-t.x,-t.y)) + 2.0*texture2D(tex, uv+vec2(0.,-t.y)) + texture2D(tex, uv+vec2(t.x,-t.y))
-                - texture2D(tex, uv+vec2(-t.x,t.y)) - 2.0*texture2D(tex, uv+vec2(0.,t.y)) - texture2D(tex, uv+vec2(t.x,t.y));
-        float g = length(gx.rgb) + length(gy.rgb);
-        c = vec4(vec3(g), 1.0);
-      } else if(mode==3){ // псевдо-тепловизор
-        float lum = dot(c.rgb, vec3(0.299,0.587,0.114));
-        vec3 col = mix(vec3(0.,0.,1.), vec3(1.,0.,0.), lum);
-        c = vec4(col, 1.0);
-      } else if(mode==4){ // ночное видение (усиление + зелёный)
-        float lum = dot(c.rgb, vec3(0.299,0.587,0.114));
-        lum = pow(lum, 0.45); // гамма-усиление
-        c = vec4(0.1*lum, lum, 0.1*lum, 1.0);
-      }
-      gl_FragColor = c;
+      vec4 cur = texture2D(currentTex, uv);
+      vec4 prev = texture2D(prevTex, uv);
+      
+      // Усиление яркости (гамма) для ночной камеры
+      vec3 brightCur = pow(cur.rgb, vec3(0.6));
+      
+      // Смешиваем текущий яркий кадр с предыдущим (накопление света)
+      vec4 mixed = mix(prev, vec4(brightCur, 1.0), blend);
+      
+      // Зеленый фильтр ночного видения
+      float lum = dot(mixed.rgb, vec3(0.299,0.587,0.114));
+      vec3 nv = vec3(lum*0.2, lum*1.2, lum*0.2); // Зеленый HUD
+      
+      gl_FragColor = vec4(nv, 1.0);
     }`;
 
   function compile(shader, src, type){
     const s = gl.createShader(type);
-    gl.shaderSource(s, src);
-    gl.compileShader(s);
-    if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s));
-    return s;
+    gl.shaderSource(s, src); gl.compileShader(s); return s;
   }
   const prog = gl.createProgram();
   gl.attachShader(prog, compile(gl, vs, gl.VERTEX_SHADER));
-  gl.attachShader(prog, compile(gl, fsSource, gl.FRAGMENT_SHADER));
-  gl.linkProgram(prog);
-  gl.useProgram(prog);
+  gl.attachShader(prog, compile(gl, fs, gl.FRAGMENT_SHADER));
+  gl.linkProgram(prog); gl.useProgram(prog);
 
   const buf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, buf);
@@ -101,17 +114,31 @@
   gl.enableVertexAttribArray(aLoc);
   gl.vertexAttribPointer(aLoc, 2, gl.FLOAT, false, 0, 0);
 
-  const tex = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, tex);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  const texCur = gl.createTexture();
+  const texPrev = gl.createTexture();
+  
+  function setupTex(tex){
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  }
+  setupTex(texCur); setupTex(texPrev);
 
-  const uMode = gl.getUniformLocation(prog, 'mode');
-  const uRes = gl.getUniformLocation(prog, 'resolution');
+  const uCur = gl.getUniformLocation(prog, 'currentTex');
+  const uPrev = gl.getUniformLocation(prog, 'prevTex');
+  const uBlend = gl.getUniformLocation(prog, 'blend');
 
   let currentStream = null;
+  let isStacking = true;
+  let isMotionDetect = true;
+  let prevFrameData = null;
+  let motionCanvasScaled = document.createElement('canvas');
+  motionCanvasScaled.width = 160; 
+  motionCanvasScaled.height = 120;
+  let mScaledCtx = motionCanvasScaled.getContext('2d', { willReadFrequently: true });
 
+  // --- Логика камеры ---
   async function listCameras(){
     const devices = await navigator.mediaDevices.enumerateDevices();
     const cams = devices.filter(d => d.kind === 'videoinput');
@@ -120,67 +147,149 @@
     cams.forEach((cam, i) => {
       const opt = document.createElement('option');
       opt.value = cam.deviceId;
-      opt.textContent = cam.label || `Камера ${i+1}`;
+      opt.textContent = cam.label || `CAM ${i+1}`;
       sel.appendChild(opt);
     });
-    document.getElementById('status').textContent = `Найдено камер: ${cams.length}`;
     return cams;
   }
 
   async function startCamera(deviceId){
     if(currentStream) currentStream.getTracks().forEach(t => t.stop());
     try {
-      const constraints = {
-        video: {
-          deviceId: deviceId ? { exact: deviceId } : undefined,
-          facingMode: deviceId ? undefined : 'environment',
-          width: { ideal: 1920 },
-          height: { ideal: 1080 }
-        }
-      };
-      currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+      // Запрашиваем максимальное разрешение для вашей 108MP/20MP камеры
+      currentStream = await navigator.mediaDevices.getUserMedia({
+        video: { deviceId: deviceId ? { exact: deviceId } : undefined, width: { ideal: 1920 }, height: { ideal: 1080 } }
+      });
       video.srcObject = currentStream;
       await video.play();
-      document.getElementById('status').textContent = 'Камера активна';
-    } catch(e) {
-      document.getElementById('status').textContent = 'Ошибка: ' + e.message;
-    }
+      statusEl.textContent = 'SYS.ACTIVE // SCANNING';
+    } catch(e) { statusEl.textContent = 'ERR: ' + e.message; }
   }
 
-  // Инициализация
   await listCameras();
   const firstCam = document.getElementById('cameraSelect').value;
   if(firstCam) await startCamera(firstCam);
-
   document.getElementById('cameraSelect').addEventListener('change', e => startCamera(e.target.value));
 
-  // Рендер-цикл
+  // --- Детектор движения (Анализ пикселей) ---
+  function detectMotion(){
+    if(!isMotionDetect || video.readyState < 2) {
+      targetBox.style.display = 'none';
+      return;
+    }
+    
+    // Рисуем текущий кадр в маленький скрытый canvas для скорости
+    mScaledCtx.drawImage(video, 0, 0, 160, 120);
+    const frameData = mScaledCtx.getImageData(0, 0, 160, 120).data;
+    
+    if(prevFrameData) {
+      let minX = 160, minY = 120, maxX = 0, maxY = 0;
+      let hasMotion = false;
+      let diffCount = 0;
+
+      // Ищем разницу между кадрами
+      for (let y = 0; y < 120; y++) {
+        for (let x = 0; x < 160; x++) {
+          const i = (y * 160 + x) * 4;
+          // Разница в яркости (R-канал)
+          const diff = Math.abs(frameData[i] - prevFrameData[i]);
+          
+          if (diff > 40) { // Порог чувствительности
+            hasMotion = true;
+            diffCount++;
+            if(x < minX) minX = x;
+            if(x > maxX) maxX = x;
+            if(y < minY) minY = y;
+            if(y > maxY) maxY = y;
+          }
+        }
+      }
+
+      // Если движения достаточно много, рисуем прицел
+      if (hasMotion && diffCount > 20) {
+        // Переводим координаты из 160x120 в размеры экрана
+        const scaleX = window.innerWidth / 160;
+        const scaleY = window.innerHeight / 120;
+        
+        // Расширяем рамку
+        const boxW = (maxX - minX) * scaleX;
+        const boxH = (maxY - minY) * scaleY;
+        
+        targetBox.style.display = 'block';
+        targetBox.style.left = (minX * scaleX) + 'px';
+        targetBox.style.top = (minY * scaleY) + 'px';
+        targetBox.style.width = Math.max(boxW, 50) + 'px'; // Мин. размер
+        targetBox.style.height = Math.max(boxH, 50) + 'px';
+      } else {
+        targetBox.style.display = 'none';
+      }
+    }
+    prevFrameData = frameData;
+  }
+
+  // --- Главный цикл ---
   function render(){
     if(video.readyState >= 2){
       if(canvas.width !== video.videoWidth){
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
+        mCanvas.width = window.innerWidth;
+        mCanvas.height = window.innerHeight;
         gl.viewport(0, 0, canvas.width, canvas.height);
       }
-      gl.bindTexture(gl.TEXTURE_2D, tex);
+
+      // WebGL Рендер
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, texCur);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
-      const mode = parseInt(document.getElementById('filterSelect').value === 'none' ? 0 :
-        document.getElementById('filterSelect').value === 'pixelate' ? 1 :
-        document.getElementById('filterSelect').value === 'edge' ? 2 :
-        document.getElementById('filterSelect').value === 'thermal' ? 3 : 4);
-      gl.uniform1i(uMode, mode);
-      gl.uniform2f(uRes, canvas.width, canvas.height);
+      gl.uniform1i(uCur, 0);
+
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, texPrev);
+      gl.uniform1i(uPrev, 1);
+
+      // Если стекинг выключен, blend = 1.0 (показываем только текущий кадр)
+      // Если включен, blend = 0.1 (90% старого света + 10% нового = накопление)
+      gl.uniform1f(uBlend, isStacking ? 0.15 : 1.0);
+      
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+      // Копируем текущий отрендеренный кадр в текстуру для следующего шага (для стекинга)
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, texPrev);
+      gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 0, 0, canvas.width, canvas.height, 0);
+
+      // Детекция движения
+      detectMotion();
     }
     requestAnimationFrame(render);
   }
   render();
 
-  // Снимок
-  document.getElementById('snap').addEventListener('click', () => {
+  // UI Кнопки
+  document.getElementById('btn-stack').addEventListener('click', (e) => {
+    isStacking = !isStacking;
+    e.target.classList.toggle('active', isStacking);
+    e.target.textContent = `📷 Стекинг: ${isStacking ? 'ВКЛ' : 'ВЫКЛ'}`;
+  });
+
+  document.getElementById('btn-motion').addEventListener('click', (e) => {
+    isMotionDetect = !isMotionDetect;
+    e.target.classList.toggle('active', isMotionDetect);
+    e.target.textContent = `🎯 Детектор: ${isMotionDetect ? 'ВКЛ' : 'ВЫКЛ'}`;
+    if(!isMotionDetect) targetBox.style.display = 'none';
+  });
+
+  document.getElementById('btn-snap').addEventListener('click', () => {
+    // Делаем скриншот того, что видит пользователь (видео + HUD)
+    const exportCanvas = document.createElement('canvas');
+    exportCanvas.width = canvas.width;
+    exportCanvas.height = canvas.height;
+    const ctx = exportCanvas.getContext('2d');
+    ctx.drawImage(canvas, 0, 0);
     const link = document.createElement('a');
-    link.download = 'camera-lab-' + Date.now() + '.png';
-    link.href = canvas.toDataURL('image/png');
+    link.download = 'AEGIS-' + Date.now() + '.png';
+    link.href = exportCanvas.toDataURL('image/png');
     link.click();
   });
 })();
